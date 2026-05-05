@@ -63,10 +63,20 @@ run_check "RHAIS image is available locally" bash -lc "podman image exists '${RH
 
 echo
 echo "== Optional: HuggingFace token =="
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  warn "HF_TOKEN is not set. This tutorial’s model should work without it, but if downloads fail you may need a token."
+HF_TOKEN_VALUE="${HUGGING_FACE_HUB_TOKEN:-${HF_HUB_TOKEN:-${HF_TOKEN:-}}}"
+HF_TOKEN_SOURCE=""
+if [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  HF_TOKEN_SOURCE="HUGGING_FACE_HUB_TOKEN"
+elif [[ -n "${HF_HUB_TOKEN:-}" ]]; then
+  HF_TOKEN_SOURCE="HF_HUB_TOKEN"
+elif [[ -n "${HF_TOKEN:-}" ]]; then
+  HF_TOKEN_SOURCE="HF_TOKEN"
+fi
+
+if [[ -z "${HF_TOKEN_VALUE}" ]]; then
+  warn "No Hugging Face token env var detected (checked: HUGGING_FACE_HUB_TOKEN, HF_HUB_TOKEN, HF_TOKEN). This tutorial’s model may still work without one, but if downloads fail you may need a token."
 else
-  ok "HF_TOKEN is set (optional)"
+  ok "Hugging Face token is set via ${HF_TOKEN_SOURCE} (optional)"
   pass_count=$((pass_count + 1))
 fi
 
