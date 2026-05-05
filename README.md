@@ -161,6 +161,12 @@ Set model + port:
 export MODEL="RedHatAI/Qwen2-72B-Instruct-FP8"
 export PORT=8000
 
+# If 8000 is already in use, pick another port (for example 8001).
+if ss -ltn "sport = :${PORT}" | awk 'NR>1{found=1} END{exit !found}'; then
+  echo "Port ${PORT} is already in use; switching to 8001"
+  export PORT=8001
+fi
+
 export VIDEO_GID="$(getent group video | cut -d: -f3)"
 export RENDER_GID="$(getent group render | cut -d: -f3)"
 
@@ -197,6 +203,13 @@ Notes:
  - The `HF_CACHE_DIR` mount ensures model weights are cached. Subsequent instances of the same model typically start in ~30s.
 
 ### 3.3 Poll health
+
+If you open a new shell, previously exported variables (like `PORT`) will be empty. Re-export them before health checks/log commands:
+
+```bash
+export MODEL="${MODEL:-RedHatAI/Qwen2-72B-Instruct-FP8}"
+export PORT="${PORT:-8000}"
+```
 
 ```bash
 for i in {1..60}; do
