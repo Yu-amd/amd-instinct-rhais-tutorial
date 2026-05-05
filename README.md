@@ -190,6 +190,10 @@ podman run -d \
   --group-add "${RENDER_GID}" \
   --shm-size=8GB \
   --network=host \
+  -e HF_HUB_OFFLINE=false \
+  -e TRANSFORMERS_OFFLINE=false \
+  -e HF_DATASETS_OFFLINE=false \
+  -e HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-${HF_HUB_TOKEN:-${HF_TOKEN:-}}}" \
   -v "${HF_CACHE_DIR}:/root/.cache/huggingface:rw" \
   registry.redhat.io/rhaiis/vllm-rocm-rhel9:3.2.5 \
   --model "${MODEL}" \
@@ -201,6 +205,7 @@ podman run -d \
 Notes:
  - The container is on `--network=host`, so the vLLM server listens directly on the host port.
  - The `HF_CACHE_DIR` mount ensures model weights are cached. Subsequent instances of the same model typically start in ~30s.
+ - Offline environment flags are explicitly disabled above so first-run model downloads work even if your shell has offline-related vars set.
 
 ### 3.3 Poll health
 
@@ -256,6 +261,16 @@ This section starts:
 From the repo root:
 
 ```bash
+# Use the same port your RHAIS server is actually running on.
+export PORT="${PORT:-8000}"
+
+# Keep Prometheus scrape target aligned with the active RHAIS port.
+sed -i -E "s#(targets: \\['host\\.docker\\.internal:)[0-9]+('\\])#\\1${PORT}\\2#" grafana/prometheus.yml
+```
+
+Start the monitoring services:
+
+```bash
 docker compose -f grafana/docker-compose.yml up -d
 ```
 
@@ -265,48 +280,44 @@ Wait for Prometheus and Grafana to come up:
 docker compose -f grafana/docker-compose.yml ps
 ```
 
+Verify Prometheus can scrape the active RHAIS target (must show `health` as `up`):
+
+```bash
+curl -s "http://localhost:9090/api/v1/targets" | jq -r '
+  .data.activeTargets[] |
+  select(.labels.job=="vllm-primary") |
+  [.scrapeUrl, .health, .lastError] | @tsv
+'
+```
+
 Grafana UI:
  - `http://<DROPLET_IP>:3000`
  - Default credentials (in this repo’s compose file): `admin` / `admin`
 
-### 4.2 Datasource UID note (important)
+### 4.2 Datasource + dashboard provisioning
 
-Grafana auto-generates datasource UIDs. The dashboard JSON in `grafana/dashboards/rhais_tutorial.json` intentionally references a UID of `prometheus`.
+This repo provisions both:
+- datasource `Prometheus` with fixed UID `prometheus`
+- dashboard JSON that references datasource UID `prometheus`
 
-To ensure the dashboard shows data, you must replace the datasource UID with your Grafana instance’s actual UID before import.
+So you do **not** need manual datasource UID substitution or API dashboard import.
 
-Retrieve your datasource list:
+If you updated this repo from an older revision, restart Grafana so provisioned datasource settings are reloaded:
 
 ```bash
-curl -s "http://admin:admin@localhost:3000/api/datasources" | sed -n '1,120p'
+docker compose -f grafana/docker-compose.yml restart grafana
 ```
 
-Then extract the UID for the datasource named `Prometheus` (example uses `jq`; install if missing):
+Quick verification:
 
 ```bash
-DS_UID="$(curl -s "http://admin:admin@localhost:3000/api/datasources" | jq -r '.[] | select(.name=="Prometheus") | .uid')"
-echo "Prometheus datasource UID: $DS_UID"
+curl -s "http://admin:admin@localhost:3000/api/datasources" | jq -r '.[] | [.name,.uid,.type] | @tsv'
 ```
 
-Import the dashboard via Grafana’s API (recommended):
+Expected output should include:
 
-```bash
-DASH_FILE="grafana/dashboards/rhais_tutorial.json"
-TMP_FILE="$(mktemp)"
-
-jq --arg DS_UID "$DS_UID" '
-  walk(
-    if type=="object" and has("uid") and .uid=="prometheus" then
-      .uid=$DS_UID
-    else .
-    end
-  )
-' "$DASH_FILE" > "$TMP_FILE"
-
-curl -sS -u admin:admin \
-  -H "Content-Type: application/json" \
-  -X POST "http://localhost:3000/api/dashboards/db" \
-  -d @"$TMP_FILE" >/dev/null
+```text
+Prometheus    prometheus    prometheus
 ```
 
 ### 4.3 What you should see (key RHAIS/vLLM metrics)
@@ -371,12 +382,12 @@ python3 -m pip install --user locust
 
 Target host should be the RHAIS endpoint or nginx load balancer endpoint (if you enabled scaling+nginx).
 
-Direct to RHAIS on port `8000`:
+Direct to RHAIS on your active `PORT`:
 
 ```bash
 locust -f loadtest/locust_inference.py \
   --headless \
-  --host "http://<DROPLET_IP>:8000" \
+  --host "http://<DROPLET_IP>:${PORT}" \
   -u 50 -r 5 -t 3m
 ```
 
@@ -390,7 +401,7 @@ Interpretation hints:
 Scaling in this tutorial means starting additional RHAIS/vLLM servers on additional ports.
 
 We assume you already have:
-- a primary instance on port `8000` from Section 3
+- a primary instance from Section 3 (typically `8000`, unless you switched ports)
 - monitoring stack running from Section 4
 
 ### 6.1 Detect available GPUs
@@ -533,7 +544,7 @@ Common cause:
 Fix:
 1. Verify Prometheus’ scrape target is reachable from the Docker network:
    ```bash
-   curl -sS "http://host.docker.internal:8000/metrics" | head -n 5
+   curl -sS "http://host.docker.internal:${PORT:-8000}/metrics" | head -n 5
    ```
 2. Ensure `grafana/docker-compose.yml` contains the `extra_hosts` entry for `host.docker.internal`.
 3. Restart monitoring stack:
@@ -541,34 +552,22 @@ Fix:
    docker compose -f grafana/docker-compose.yml restart prometheus
    ```
 
-### Grafana shows panels but “no data” (datasource UID mismatch)
+### Grafana shows panels but “no data” (datasource/provisioning mismatch)
 
 Cause:
-- The dashboard JSON references a datasource UID of `prometheus`, but Grafana auto-generates a different UID.
+- Grafana was started before datasource provisioning changes (or has stale state), so datasource UID does not match dashboard expectations.
 
-Fix (API import with substituted datasource UID):
-1. Retrieve the actual datasource UID:
+Fix:
+1. Restart Grafana and Prometheus:
    ```bash
-   DS_UID="$(curl -s "http://admin:admin@localhost:3000/api/datasources" | jq -r '.[] | select(.name=="Prometheus") | .uid')"
-   echo "$DS_UID"
+   docker compose -f grafana/docker-compose.yml restart grafana prometheus
    ```
-2. Re-write the dashboard JSON with the substituted UID and import via:
+2. Verify datasource UID is `prometheus`:
    ```bash
-   DASH_FILE="grafana/dashboards/rhais_tutorial.json"
-   TMP_FILE="$(mktemp)"
-
-   jq --arg DS_UID "$DS_UID" '
-     walk(
-       if type=="object" and has("uid") and .uid=="prometheus" then
-         .uid=$DS_UID
-       else .
-       end
-     )
-   ' "$DASH_FILE" > "$TMP_FILE"
-
-   curl -sS -u admin:admin \
-     -H "Content-Type: application/json" \
-     -X POST "http://localhost:3000/api/dashboards/db" \
-     -d @"$TMP_FILE"
+   curl -s "http://admin:admin@localhost:3000/api/datasources" | jq -r '.[] | [.name,.uid,.type] | @tsv'
+   ```
+3. Verify Prometheus target is `up` and scrape URL points to your active port:
+   ```bash
+   curl -s "http://localhost:9090/api/v1/targets" | jq -r '.data.activeTargets[] | [.labels.job,.scrapeUrl,.health,.lastError] | @tsv'
    ```
 
