@@ -1,1 +1,517 @@
-# amd-instinct-rhais-tutorial
+# AMD Instinct + RHAIS Tutorial (DigitalOcean MI300X)
+
+This repository is a practitioner’s guide for running **Red Hat AI Inference Server (RHAIS)** on a **DigitalOcean (DO) AMD Instinct MI300X GPU droplet** using **Podman** (for inference) plus **Prometheus + Grafana** (for observability).
+
+The target audience is **ML engineers / platform engineers** with basic Linux experience, but who may not have used RHAIS before.
+
+## Prerequisites
+
+You’ll need:
+
+1. A **DigitalOcean account** with access to GPU Droplets in the **ATL region**.
+2. A **Red Hat account** with access to a **RHAIS trial** (used for pulling the RHAIS container image).
+3. A **HuggingFace account** (to download models). For this tutorial’s model, **you do not need an HF token**.
+4. Basic Linux knowledge (SSH, `sudo`, editing/reading logs, `curl`).
+5. Tools locally on the droplet:
+   - `podman`
+   - `curl`
+   - `docker` (for the monitoring stack)
+   - `rocm-smi` (usually installed/enabled on the DO ROCm image)
+
+> Important platform detail (Ubuntu DO droplets):
+>
+> The GPU device nodes exist, but **Podman must be able to pass the ROCm GPU “groups”** into the container. On these Ubuntu droplets you must add the user to `video` and `render`:
+>
+> ```bash
+> sudo usermod -aG video root && sudo usermod -aG render root
+> ```
+>
+> If your DO SSH user is not `root`, replace `root` with your username.
+
+## Section 1: Provision a GPU Droplet
+
+1. In DigitalOcean, create a new **Droplet**.
+2. Choose:
+   - Region: **ATL (Atlanta)**
+   - Hardware/accelerator: **AMD Instinct MI300X**
+   - OS: **Ubuntu 22.04** with **ROCm** (use the DO ROCm image)
+3. Attach your SSH keys and create the droplet.
+
+After provisioning, SSH into it:
+
+```bash
+ssh root@<DROPLET_IP>
+```
+
+## Section 2: Environment setup
+
+### 2.1 Install Podman (if needed)
+
+On Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y podman
+```
+
+Verify:
+
+```bash
+podman --version
+```
+
+### 2.2 Log into the Red Hat registry
+
+Login to `registry.redhat.io` so you can pull the RHAIS image:
+
+```bash
+podman login registry.redhat.io
+```
+
+Use your Red Hat username + password/API token as prompted.
+
+### 2.3 Fix Podman GPU group permissions (required)
+
+The tutorial uses these group IDs dynamically:
+
+```bash
+VIDEO_GID="$(getent group video | cut -d: -f3)"
+RENDER_GID="$(getent group render | cut -d: -f3)"
+echo "VIDEO_GID=$VIDEO_GID"
+echo "RENDER_GID=$RENDER_GID"
+```
+
+Apply the group membership fix:
+
+```bash
+sudo usermod -aG video root && sudo usermod -aG render root
+```
+
+Then log out/in (or `newgrp`) so group membership takes effect:
+
+```bash
+newgrp video || true
+newgrp render || true
+```
+
+### 2.4 Pull the RHAIS image
+
+```bash
+podman pull registry.redhat.io/rhaiis/vllm-rocm-rhel9:3.2.5
+```
+
+## Section 3: Run a single RHAIS instance (Qwen2-72B FP8)
+
+### 3.1 Pre-flight checks
+
+Run:
+
+```bash
+./scripts/00_preflight.sh
+```
+
+### 3.2 Start the server
+
+Set model + port:
+
+```bash
+export MODEL="RedHatAI/Qwen2-72B-Instruct-FP8"
+export PORT=8000
+
+export VIDEO_GID="$(getent group video | cut -d: -f3)"
+export RENDER_GID="$(getent group render | cut -d: -f3)"
+
+export HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+```
+
+RHAIS uses **vLLM as its entrypoint**. That means you pass vLLM arguments as **container arguments** (i.e., after the image name). In this tutorial we use **`--dtype auto`** for the FP8 quantized model.
+
+Run the container:
+
+```bash
+podman rm -f "rhais-${PORT}" 2>/dev/null || true
+
+podman run -d \
+  --name "rhais-${PORT}" \
+  --security-opt=label=disable \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --group-add "${VIDEO_GID}" \
+  --group-add "${RENDER_GID}" \
+  --shm-size=8GB \
+  --network=host \
+  -v "${HF_CACHE_DIR}:/root/.cache/huggingface:rw" \
+  registry.redhat.io/rhaiis/vllm-rocm-rhel9:3.2.5 \
+  --model "${MODEL}" \
+  --dtype auto \
+  --host 0.0.0.0 \
+  --port "${PORT}"
+```
+
+Notes:
+ - The container is on `--network=host`, so the vLLM server listens directly on the host port.
+ - The `HF_CACHE_DIR` mount ensures model weights are cached. Subsequent instances of the same model typically start in ~30s.
+
+### 3.3 Poll health
+
+```bash
+for i in {1..60}; do
+  if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null; then
+    echo "RHAIS is healthy on port ${PORT}"
+    break
+  fi
+  sleep 2
+done
+```
+
+### 3.4 Send a test completion
+
+This uses the OpenAI-compatible `/v1/chat/completions` endpoint and does **not** require an HF token for this model.
+
+```bash
+curl -sS -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "'"${MODEL}"'",
+    "messages": [
+      {"role": "user", "content": "Write a short haiku about AMD Instinct."}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 64
+  }'
+```
+
+### 3.5 List models
+
+```bash
+curl -sS "http://127.0.0.1:${PORT}/v1/models" | head -c 4000
+echo
+```
+
+## Section 4: Observability (Prometheus + Grafana)
+
+This section starts:
+- **Prometheus** to scrape RHAIS’ `/metrics`
+- **Grafana** to visualize RHAIS’ vLLM metrics
+
+### 4.1 Start monitoring stack
+
+From the repo root:
+
+```bash
+docker compose -f grafana/docker-compose.yml up -d
+```
+
+Wait for Prometheus and Grafana to come up:
+
+```bash
+docker compose -f grafana/docker-compose.yml ps
+```
+
+Grafana UI:
+ - `http://<DROPLET_IP>:3000`
+ - Default credentials (in this repo’s compose file): `admin` / `admin`
+
+### 4.2 Datasource UID note (important)
+
+Grafana auto-generates datasource UIDs. The dashboard JSON in `grafana/dashboards/rhais_tutorial.json` intentionally references a UID of `prometheus`.
+
+To ensure the dashboard shows data, you must replace the datasource UID with your Grafana instance’s actual UID before import.
+
+Retrieve your datasource list:
+
+```bash
+curl -s "http://admin:admin@localhost:3000/api/datasources" | sed -n '1,120p'
+```
+
+Then extract the UID for the datasource named `Prometheus` (example uses `jq`; install if missing):
+
+```bash
+DS_UID="$(curl -s "http://admin:admin@localhost:3000/api/datasources" | jq -r '.[] | select(.name=="Prometheus") | .uid')"
+echo "Prometheus datasource UID: $DS_UID"
+```
+
+Import the dashboard via Grafana’s API (recommended):
+
+```bash
+DASH_FILE="grafana/dashboards/rhais_tutorial.json"
+TMP_FILE="$(mktemp)"
+
+jq --arg DS_UID "$DS_UID" '
+  walk(
+    if type=="object" and has("uid") and .uid=="prometheus" then
+      .uid=$DS_UID
+    else .
+    end
+  )
+' "$DASH_FILE" > "$TMP_FILE"
+
+curl -sS -u admin:admin \
+  -H "Content-Type: application/json" \
+  -X POST "http://localhost:3000/api/dashboards/db" \
+  -d @"$TMP_FILE" >/dev/null
+```
+
+### 4.3 What you should see (key RHAIS/vLLM metrics)
+
+RHAIS exposes vLLM metrics via `/metrics` on the **same port as the inference server**.
+
+This tutorial’s Grafana dashboard visualizes:
+- `vllm:request_success_total`
+- `vllm:time_to_first_token_seconds_bucket`
+- `vllm:e2e_request_latency_seconds_bucket`
+- `vllm:kv_cache_usage_perc`
+- `vllm:num_requests_running`
+- `vllm:num_requests_waiting`
+- `vllm:generation_tokens_total`
+- `vllm:time_per_output_token_seconds_bucket`
+- `vllm:request_queue_time_seconds_bucket`
+
+Grafana panels:
+1. Success throughput
+2. TTFT P99 (ms) with thresholds
+3. ITL (time-per-output-token) P99 (ms) with thresholds
+4. E2E latency P99 (ms)
+5. Queue time P99 (ms)
+6. KV cache usage (%)
+7. Requests running
+8. Requests waiting
+9. Tokens generated
+10. TTFT P50 (ms)
+11. ITL P50 (ms)
+12. E2E latency P50 (ms)
+
+Quick panel guide (what “good” looks like):
+- Success throughput (`vllm:request_success_total`): stable or rising throughput; drops usually indicate saturation.
+- TTFT P99 (`vllm:time_to_first_token_seconds_bucket`): tail prompt-to-first-token latency. Thresholds: yellow `>500ms`, red `>2000ms`.
+- ITL P99 (`vllm:time_per_output_token_seconds_bucket`): per-output-token decode latency. Thresholds: yellow `>50ms`, red `>100ms`.
+- E2E latency P99 (`vllm:e2e_request_latency_seconds_bucket`): end-to-end tail latency; correlate with TTFT/ITL.
+- Queue time P99 (`vllm:request_queue_time_seconds_bucket`): how long requests wait before starting. Rising queue time indicates capacity limits.
+- KV cache usage (`vllm:kv_cache_usage_perc`): tail-serving memory pressure. Thresholds: yellow `>70%`, red `>90%` (scale out).
+- Requests running (`vllm:num_requests_running`): currently being served; should stabilize under steady load.
+- Requests waiting (`vllm:num_requests_waiting`): queued backlog; if it grows, you’re under-provisioned.
+- Tokens generated (`vllm:generation_tokens_total`): output throughput; often plateaus as the server saturates.
+- TTFT P50 / ITL P50 / E2E P50: medians to distinguish outlier/tail issues (P99) from system-wide slowdowns.
+
+For deeper explanations and what action to take when thresholds are breached, read `docs/observability.md`.
+
+## Section 5: Load testing with Locust
+
+This tutorial includes a Locust scenario that issues:
+- short completions (task weight `8`)
+- long completions (task weight `2`)
+- health checks (task weight `1`)
+
+### 5.1 Install Locust
+
+On the droplet (or your dev machine pointed at the droplet):
+
+```bash
+python3 -m pip install --user locust
+```
+
+### 5.2 Run Locust (example)
+
+Target host should be the RHAIS endpoint or nginx load balancer endpoint (if you enabled scaling+nginx).
+
+Direct to RHAIS on port `8000`:
+
+```bash
+locust -f loadtest/locust_inference.py \
+  --headless \
+  --host "http://<DROPLET_IP>:8000" \
+  -u 50 -r 5 -t 3m
+```
+
+Interpretation hints:
+- If **Grafana TTFT P99** rises quickly, the server is saturating.
+- If **requests waiting** rises while running stays flat, queueing is growing.
+- If **KV cache usage** approaches the configured memory pressure, you may need to scale out.
+
+## Section 6: Scaling to multiple instances
+
+Scaling in this tutorial means starting additional RHAIS/vLLM servers on additional ports.
+
+We assume you already have:
+- a primary instance on port `8000` from Section 3
+- monitoring stack running from Section 4
+
+### 6.1 Detect available GPUs
+
+On the DO MI300X ROCm image:
+
+```bash
+rocm-smi --showid
+```
+
+Count GPUs and decide how many instances you can fit per GPU based on HBM3 size (see Section 7 for the reference table).
+
+### 6.2 Scale out
+
+Run:
+
+```bash
+./scripts/02_scale.sh <TARGET_INSTANCES>
+```
+
+Behavior:
+- Detects currently running RHAIS containers for the configured image
+- Starts additional replicas on sequential ports `8001..800N`
+- Updates an nginx upstream configuration and reloads nginx
+- Updates Prometheus scrape jobs for new ports and reloads Prometheus
+- Prints a health summary table for all ports
+
+Prereq for nginx:
+- Ensure `nginx` is installed and you have `sudo` access. The script writes `/etc/nginx/conf.d/rhais_upstream.conf` and reloads nginx.
+- Default nginx listen port is `8080` (override via `NGINX_LISTEN_PORT` env var when running the script).
+
+Access:
+- RHAIS remains reachable directly on each port
+- After nginx upstream update, you can also use nginx for load distribution (nginx listens on the configured port in the script)
+
+### 6.3 Prometheus and host networking detail
+
+Prometheus runs in Docker, while inference runs on Podman with `--network=host`.
+
+To bridge Docker->host networking reliably, this repo’s `grafana/docker-compose.yml` includes:
+- an `extra_hosts` entry for `host.docker.internal`
+- Prometheus scrape targets use `host.docker.internal:<PORT>`
+
+### 6.4 Scaling formula (how to decide TARGET_INSTANCES)
+
+Use Section 7’s reference table and/or this rule of thumb:
+
+```text
+instances_per_gpu = floor( (HBM3_GiB * utilization_factor) / memory_per_instance_GiB )
+```
+
+Then:
+
+```text
+total_instances ~= instances_per_gpu * num_gpus
+```
+
+The table below uses:
+- MI300X HBM3: `192 GiB` per GPU
+- utilization headroom factor: `0.85`
+
+## Section 7: Scaling formula reference table
+
+These are **approximate** capacity planning numbers based on weights in FP8/FP16 (plus a small overhead factor). Real capacity will vary with vLLM settings (max tokens, batch sizing, KV cache behavior, etc.).
+
+Assumptions used for planning:
+- MI300X HBM3 per GPU: `192 GiB`
+- Headroom factor: `0.85`
+- FP8 weight overhead factor: `1.15`
+- FP16 weight overhead factor: `1.10`
+
+| Model | Weight memory FP8 (GiB) | Instances/GPU (FP8) | Weight memory FP16 (GiB) | Instances/GPU (FP16) | Instances/8-GPU node (FP8) | Instances/8-GPU node (FP16) |
+|---|---:|---:|---:|---:|---:|---:|
+| 7B | ~7.5 | ~21 | ~14.3 | ~11 | ~168 | ~88 |
+| 13B | ~13.9 | ~11 | ~26.6 | ~6 | ~88 | ~48 |
+| 34B | ~36.4 | ~4 | ~69.7 | ~2 | ~32 | ~16 |
+| 70B/72B | ~77.1 | ~2 | ~147.5 | ~1 | ~16 | ~8 |
+
+For Qwen2-72B FP8 specifically, the planning assumption suggests roughly **2 instances per GPU** if weights dominate memory; you should confirm with actual Grafana KV cache + latency behavior.
+
+## Section 8: Teardown
+
+Stop everything created by this tutorial:
+
+```bash
+./scripts/03_teardown.sh
+```
+
+Then destroy the droplet in DigitalOcean when you are done (to avoid incurring GPU costs).
+
+---
+
+## Troubleshooting
+
+### No HIP GPUs are available (Podman/container sees no devices)
+
+Symptom:
+- Container logs show errors like “No HIP GPUs are available”.
+
+Fix:
+1. Confirm the host has the groups:
+   ```bash
+   getent group video
+   getent group render
+   ```
+2. Apply the required group membership fix (Ubuntu DO droplets):
+   ```bash
+   sudo usermod -aG video root && sudo usermod -aG render root
+   ```
+3. Log out and back in so group membership takes effect.
+4. Re-run `./scripts/00_preflight.sh`.
+
+### registry auth failures (cannot pull RHAIS image)
+
+Fix:
+1. Re-run:
+   ```bash
+   podman login registry.redhat.io
+   ```
+2. Verify you can pull:
+   ```bash
+   podman pull registry.redhat.io/rhaiis/vllm-rocm-rhel9:3.2.5
+   ```
+
+### Model download timeouts
+
+Symptoms:
+- Long stalls during container startup while downloading weights.
+
+Fix:
+1. Ensure you have stable outbound connectivity from the droplet.
+2. Confirm `HF_CACHE_DIR` is mounted (weights cache in the volume mount).
+3. Restart the server once network is stable; cached weights usually reduce subsequent startup to ~30s.
+
+### Prometheus not scraping (no metrics / missing panels)
+
+Common cause:
+- `host.docker.internal` does not resolve to the correct gateway in your environment.
+
+Fix:
+1. Verify Prometheus’ scrape target is reachable from the Docker network:
+   ```bash
+   curl -sS "http://host.docker.internal:8000/metrics" | head -n 5
+   ```
+2. Ensure `grafana/docker-compose.yml` contains the `extra_hosts` entry for `host.docker.internal`.
+3. Restart monitoring stack:
+   ```bash
+   docker compose -f grafana/docker-compose.yml restart prometheus
+   ```
+
+### Grafana shows panels but “no data” (datasource UID mismatch)
+
+Cause:
+- The dashboard JSON references a datasource UID of `prometheus`, but Grafana auto-generates a different UID.
+
+Fix (API import with substituted datasource UID):
+1. Retrieve the actual datasource UID:
+   ```bash
+   DS_UID="$(curl -s "http://admin:admin@localhost:3000/api/datasources" | jq -r '.[] | select(.name=="Prometheus") | .uid')"
+   echo "$DS_UID"
+   ```
+2. Re-write the dashboard JSON with the substituted UID and import via:
+   ```bash
+   DASH_FILE="grafana/dashboards/rhais_tutorial.json"
+   TMP_FILE="$(mktemp)"
+
+   jq --arg DS_UID "$DS_UID" '
+     walk(
+       if type=="object" and has("uid") and .uid=="prometheus" then
+         .uid=$DS_UID
+       else .
+       end
+     )
+   ' "$DASH_FILE" > "$TMP_FILE"
+
+   curl -sS -u admin:admin \
+     -H "Content-Type: application/json" \
+     -X POST "http://localhost:3000/api/dashboards/db" \
+     -d @"$TMP_FILE"
+   ```
+
