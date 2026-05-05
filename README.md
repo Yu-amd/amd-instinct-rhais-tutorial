@@ -165,6 +165,7 @@ export VIDEO_GID="$(getent group video | cut -d: -f3)"
 export RENDER_GID="$(getent group render | cut -d: -f3)"
 
 export HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+mkdir -p "${HF_CACHE_DIR}"
 ```
 
 RHAIS uses **vLLM as its entrypoint**. That means you pass vLLM arguments as **container arguments** (i.e., after the image name). In this tutorial we use **`--dtype auto`** for the FP8 quantized model.
