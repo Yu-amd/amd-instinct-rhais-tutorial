@@ -4,13 +4,28 @@ This repository is a practitioner’s guide for running **Red Hat AI Inference S
 
 The target audience is **ML engineers / platform engineers** with basic Linux experience, but who may not have used RHAIS before.
 
+## Section 0: Clone this repository
+
+On the machine where you plan to run the tutorial steps:
+
+```bash
+git clone https://github.com/Yu-amd/amd-instinct-rhais-tutorial.git
+cd amd-instinct-rhais-tutorial
+```
+
+If you already have the repo, pull latest changes before starting:
+
+```bash
+git pull
+```
+
 ## Prerequisites
 
 You’ll need:
 
 1. A **DigitalOcean account** with access to GPU Droplets in the **ATL region**.
 2. A **Red Hat account** with access to a **RHAIS trial** (used for pulling the RHAIS container image).
-3. A **HuggingFace account** (to download models). For this tutorial’s model, **you do not need an HF token**.
+3. A **HuggingFace account** (to download models). For this tutorial’s model, anonymous download may work, but setting an HF token is recommended to avoid rate limits/auth issues.
 4. Basic Linux knowledge (SSH, `sudo`, editing/reading logs, `curl`).
 5. Tools locally on the droplet:
    - `podman`
@@ -70,7 +85,35 @@ podman login registry.redhat.io
 
 Use your Red Hat username + password/API token as prompted.
 
-### 2.3 Fix Podman GPU group permissions (required)
+### 2.3 Configure Hugging Face token (recommended)
+
+Even though this tutorial's model may be downloadable without a token, setting one up makes downloads more reliable and is required for many gated/private models.
+
+1. Create a token in Hugging Face settings:
+   - https://huggingface.co/settings/tokens
+2. Export it in your shell:
+
+```bash
+export HUGGING_FACE_HUB_TOKEN="<your_hf_token>"
+```
+
+3. Persist it for future sessions (optional):
+
+```bash
+echo 'export HUGGING_FACE_HUB_TOKEN="<your_hf_token>"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+4. Quick check:
+
+```bash
+python3 - <<'PY'
+import os
+print("HF token set:", bool(os.getenv("HUGGING_FACE_HUB_TOKEN")))
+PY
+```
+
+### 2.4 Fix Podman GPU group permissions (required)
 
 The tutorial uses these group IDs dynamically:
 
@@ -94,7 +137,7 @@ newgrp video || true
 newgrp render || true
 ```
 
-### 2.4 Pull the RHAIS image
+### 2.5 Pull the RHAIS image
 
 ```bash
 podman pull registry.redhat.io/rhaiis/vllm-rocm-rhel9:3.2.5
