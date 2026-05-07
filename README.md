@@ -207,7 +207,7 @@ Notes:
  - The `HF_CACHE_DIR` mount ensures model weights are cached. Subsequent instances of the same model typically start in ~30s.
  - Offline environment flags are explicitly disabled above so first-run model downloads work even if your shell has offline-related vars set.
 
-### 3.3 Poll health
+### 3.3 Poll health and API readiness
 
 If you open a new shell, previously exported variables (like `PORT`) will be empty. Re-export them before health checks/log commands:
 
@@ -224,6 +224,18 @@ for i in {1..60}; do
   fi
   sleep 2
 done
+```
+
+After health reports OK, verify the OpenAI-compatible models endpoint is reachable (this avoids sending inference requests before startup fully completes):
+
+```bash
+until curl -sS "http://127.0.0.1:${PORT}/v1/models" >/dev/null; do
+  echo "waiting for vLLM on :${PORT}..."
+  sleep 5
+done
+echo "ready"
+curl -sS "http://127.0.0.1:${PORT}/v1/models" | head -c 4000
+echo
 ```
 
 ### 3.4 Send a test completion
