@@ -207,35 +207,27 @@ Notes:
  - The `HF_CACHE_DIR` mount ensures model weights are cached. Subsequent instances of the same model typically start in ~30s.
  - Offline environment flags are explicitly disabled above so first-run model downloads work even if your shell has offline-related vars set.
 
-### 3.3 Poll health and API readiness
+### 3.3 Wait for startup (container logs)
 
-If you open a new shell, previously exported variables (like `PORT`) will be empty. Re-export them before health checks/log commands:
+If you open a new shell, previously exported variables (like `PORT`) will be empty. Re-export them before following logs:
 
 ```bash
 export MODEL="${MODEL:-RedHatAI/Qwen2-72B-Instruct-FP8}"
 export PORT="${PORT:-8000}"
 ```
 
+Stream vLLM/RHAIS logs until startup finishes (Ctrl+C stops following; the server keeps running):
+
 ```bash
-for i in {1..60}; do
-  if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null; then
-    echo "RHAIS is healthy on port ${PORT}"
-    break
-  fi
-  sleep 2
-done
+podman logs -f "rhais-${PORT:-8000}"
 ```
 
-After health reports OK, verify the OpenAI-compatible models endpoint is reachable (this avoids sending inference requests before startup fully completes):
+Wait until the logs show **Application startup complete.** (Uvicorn prints this when the API server is ready). Large models may take several minutes on first load or download.
+
+If you prefer not to follow indefinitely, inspect recent output instead:
 
 ```bash
-until curl -sS "http://127.0.0.1:${PORT}/v1/models" >/dev/null; do
-  echo "waiting for vLLM on :${PORT}..."
-  sleep 5
-done
-echo "ready"
-curl -sS "http://127.0.0.1:${PORT}/v1/models" | head -c 4000
-echo
+podman logs --tail 200 "rhais-${PORT:-8000}"
 ```
 
 ### 3.4 Send a test completion
