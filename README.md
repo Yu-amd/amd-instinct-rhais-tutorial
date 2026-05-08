@@ -260,34 +260,68 @@ This section starts:
 - **Prometheus** to scrape RHAIS’ `/metrics`
 - **Grafana** to visualize RHAIS’ vLLM metrics
 
+Requirements on the droplet: **Docker / Docker Compose**, and the **RHAIS inference port** (Section 3, usually `8000`) so you can align the primary scrape target before starting the stack.
+
+**Order of operations matters:** edit `grafana/prometheus.yml` → **`chmod 0644`** that file → **`docker compose … up`**. Skipping **`chmod`** breaks Prometheus in Docker (see Troubleshooting).
+
 ### 4.1 Start monitoring stack
 
-From the repo root:
+Run every command below from the **repository root** (`cd ~/amd-instinct-rhais-tutorial` or your clone path). Paths such as `grafana/prometheus.yml` are relative to that directory.
+
+#### 4.1.1 Align scrape port and file permissions
+
+Point the primary scrape job at the same host port your RHAIS server uses (`8000` unless you switched in Section 3):
 
 ```bash
-# Use the same port your RHAIS server is actually running on.
 export PORT="${PORT:-8000}"
-
-# Keep Prometheus scrape target aligned with the active RHAIS port.
 sed -i -E "s#(targets: \\['host\\.docker\\.internal:)[0-9]+('\\])#\\1${PORT}\\2#" grafana/prometheus.yml
-
-# Prometheus in Docker runs as nobody(65534): the bind-mounted file must be world-readable.
-chmod 0644 grafana/prometheus.yml
 ```
 
-Start the monitoring services:
+**Important — `chmod 0644`:** The Prometheus image runs as **`nobody` (UID 65534)** and bind-mounts `grafana/prometheus.yml` read-only. After `sed` (or any hand edit), the file is often mode **`0600`**, which causes **`permission denied`** inside the container, a **crash/restart loop**, and Grafana failing with **`dependency prometheus failed`** / Prometheus **unhealthy**. Always fix permissions after editing:
+
+```bash
+chmod 0644 grafana/prometheus.yml
+ls -l grafana/prometheus.yml   # should show -rw-r--r--
+```
+
+Whenever you change `prometheus.yml` later (including running `./scripts/02_scale.sh`, which updates scrape jobs), run **`chmod 0644 grafana/prometheus.yml`** again if the mode reverts to **`0600`**.
+
+#### 4.1.2 Start containers (Compose project `rhaiis-monitoring`)
+
+If you upgraded this tutorial and previously had containers named `rhaiis_prometheus` / `rhaiis_grafana`, remove them once so Compose can create its own names:
+
+```bash
+docker rm -f rhaiis_prometheus rhaiis_grafana 2>/dev/null || true
+```
+
+Start or refresh the stack:
 
 ```bash
 docker compose -f grafana/docker-compose.yml up -d
 ```
 
-Wait for Prometheus and Grafana to come up:
+For a full restart:
+
+```bash
+docker compose -f grafana/docker-compose.yml down
+docker compose -f grafana/docker-compose.yml up -d
+```
+
+Wait until Prometheus is **`healthy`** and Grafana is **`Up`**:
 
 ```bash
 docker compose -f grafana/docker-compose.yml ps
 ```
 
-Verify Prometheus can scrape the active RHAIS target (must show `health` as `up`):
+(Optional) Confirm Grafana resolves the `prometheus` service on the Compose network:
+
+```bash
+docker compose -f grafana/docker-compose.yml exec grafana getent hosts prometheus
+```
+
+If that lookup fails but both containers are running, open the Grafana/Prometheus troubleshooting section below.
+
+Verify Prometheus can scrape the active RHAIS target (**`health`** must be **`up`**):
 
 ```bash
 curl -s "http://localhost:9090/api/v1/targets" | jq -r '
@@ -453,6 +487,7 @@ Notes:
 - You need `sudo` (or root) so the script can install the upstream file under `/etc/nginx/conf.d/` and reload the service.
 - Default nginx listen port is `8080` (override via `NGINX_LISTEN_PORT` when running the script).
 - If you only want to refresh Prometheus scrape jobs and skip nginx entirely: `SKIP_NGINX=1 ./scripts/02_scale.sh <TARGET_INSTANCES>`.
+- `./scripts/02_scale.sh` rewrites scrape jobs between `# SCALE_JOBS_START` / `# SCALE_JOBS_END` in `grafana/prometheus.yml` and sets **`chmod 0644`** so the Prometheus container can read the file. If you edit **`prometheus.yml`** yourself afterward, run **`chmod 0644 grafana/prometheus.yml`** and **`docker compose -f grafana/docker-compose.yml restart prometheus`**.
 
 Access:
 - RHAIS remains reachable directly on each port
@@ -585,6 +620,8 @@ Fix:
 
 ### Grafana 502 calling Prometheus (“lookup prometheus … server misbehaving”)
 
+First complete **Section 4.1** (repo root, **`chmod 0644 grafana/prometheus.yml`**, **`docker compose -f grafana/docker-compose.yml up -d`**). If Grafana still reports 502 toward **`http://prometheus:9090`**, use the steps below.
+
 Symptom:
 - Panels show HTTP 502; datasource errors mention `prometheus`, `127.0.0.11`, or “server misbehaving”.
 
@@ -592,7 +629,7 @@ Meaning:
 - Grafana is querying `http://prometheus:9090` (provisioned datasource). **`prometheus` is Docker-internal DNS.** That only works when Grafana and the Prometheus container share the **same Compose network**.
 
 Fix:
-1. Restart the monitoring stack **from `grafana/docker-compose.yml`** so both services attach to one project network (repo uses project name **`rhais-monitoring`** and shared network **`rhaiis_monitoring`**):
+1. Restart the monitoring stack **from `grafana/docker-compose.yml`** so both services attach to one project network (repo uses Compose project name **`rhaiis-monitoring`** and network **`rhaiis_monitoring`**, matching `name:` / `networks:` in `grafana/docker-compose.yml`):
    ```bash
    cd ~/amd-instinct-rhais-tutorial
    docker compose -f grafana/docker-compose.yml down
@@ -618,16 +655,14 @@ Fix:
 ### Prometheus container unhealthy / crash loop (“permission denied” on `prometheus.yml`)
 
 Symptom:
-- Grafana reports dependency failed / Prometheus unhealthy, or `docker compose ps` shows Prometheus `Restarting`.
+- Grafana reports dependency failed / Prometheus unhealthy, or `docker compose ps` shows Prometheus **`Restarting`**.
 
-Meaning:
-- The official image runs as **`nobody` (UID 65534)**. A bind-mounted `grafana/prometheus.yml` that is **`0640` / `0600` (root-only)** cannot be read inside the container.
+Cause and fix match **Section 4.1.1** (`chmod 0644` after any edit to **`grafana/prometheus.yml`**). From the repo root:
 
-Fix:
 ```bash
-chmod 0644 ~/amd-instinct-rhais-tutorial/grafana/prometheus.yml
+chmod 0644 grafana/prometheus.yml
 docker compose -f grafana/docker-compose.yml up -d
-docker logs "$(docker compose -f grafana/docker-compose.yml ps -q prometheus)" 2>&1 | tail -20
+docker compose -f grafana/docker-compose.yml logs prometheus 2>&1 | tail -30
 ```
 
 ### Prometheus not scraping (no metrics / missing panels)
