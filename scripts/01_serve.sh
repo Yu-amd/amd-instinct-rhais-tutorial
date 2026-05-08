@@ -16,6 +16,8 @@ CONTAINER_NAME="${CONTAINER_PREFIX}-${PORT}"
 
 HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
 SHM_SIZE="${SHM_SIZE:-8GB}"
+HEALTH_MAX_WAIT_SECONDS="${HEALTH_MAX_WAIT_SECONDS:-900}"
+HEALTH_POLL_INTERVAL_SECONDS="${HEALTH_POLL_INTERVAL_SECONDS:-2}"
 
 COLOR_RESET=$'\033[0m'
 COLOR_GREEN=$'\033[0;32m'
@@ -52,7 +54,10 @@ stop_existing() {
 start_container() {
   local -a env_args=()
   if [[ -n "${GPU_ID}" ]]; then
-    env_args+=(-e "HIP_VISIBLE_DEVICES=${GPU_ID}" -e "ROCR_VISIBLE_DEVICES=${GPU_ID}")
+    # On this ROCm/vLLM image, setting both HIP_VISIBLE_DEVICES and
+    # ROCR_VISIBLE_DEVICES to a non-zero index can make torch.cuda init fail.
+    # Use HIP_VISIBLE_DEVICES only for deterministic single-GPU pinning.
+    env_args+=(-e "HIP_VISIBLE_DEVICES=${GPU_ID}")
   fi
 
   # RHAIS image entrypoint is vLLM serve directly; pass model args as container arguments.
@@ -65,6 +70,10 @@ start_container() {
     --group-add "${RENDER_GID}" \
     --shm-size="${SHM_SIZE}" \
     --network=host \
+    -e HF_HUB_OFFLINE=false \
+    -e TRANSFORMERS_OFFLINE=false \
+    -e HF_DATASETS_OFFLINE=false \
+    -e HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-${HF_HUB_TOKEN:-${HF_TOKEN:-}}}" \
     -v "${HF_CACHE_DIR}:/root/.cache/huggingface:rw" \
     "${env_args[@]}" \
     "${RHAIS_IMAGE}" \
@@ -76,15 +85,19 @@ start_container() {
 
 poll_health() {
   local url="http://127.0.0.1:${PORT}/health"
+  local max_tries=$((HEALTH_MAX_WAIT_SECONDS / HEALTH_POLL_INTERVAL_SECONDS))
+  if [[ "${max_tries}" -lt 1 ]]; then
+    max_tries=1
+  fi
   echo "== Waiting for health =="
-  for i in $(seq 1 60); do
+  for i in $(seq 1 "${max_tries}"); do
     if curl -fsS "${url}" >/dev/null 2>&1; then
       ok "Healthy: ${url}"
       return 0
     fi
-    sleep 2
+    sleep "${HEALTH_POLL_INTERVAL_SECONDS}"
   done
-  err "Health check timed out: ${url}"
+  err "Health check timed out after ${HEALTH_MAX_WAIT_SECONDS}s: ${url}"
   echo
   err "Last 200 lines of podman logs:"
   podman logs --tail 200 "${CONTAINER_NAME}" || true

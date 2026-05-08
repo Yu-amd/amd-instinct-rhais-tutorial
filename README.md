@@ -420,7 +420,20 @@ Count GPUs and decide how many instances you can fit per GPU based on HBM3 size 
 
 ### 6.2 Scale out
 
-Run:
+**Install nginx first (Ubuntu).** `02_scale.sh` writes `/etc/nginx/conf.d/rhais_upstream.conf` and reloads nginx for load balancing across ports. The script checks for `nginx` before starting new instances so you do not spend time bringing up replicas only to fail at the nginx step.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y nginx
+```
+
+Verify:
+
+```bash
+command -v nginx && nginx -v
+```
+
+Run scaling (example: 8 total RHAIS containers, including the primary on `8000`):
 
 ```bash
 ./scripts/02_scale.sh <TARGET_INSTANCES>
@@ -433,9 +446,10 @@ Behavior:
 - Updates Prometheus scrape jobs for new ports and reloads Prometheus
 - Prints a health summary table for all ports
 
-Prereq for nginx:
-- Ensure `nginx` is installed and you have `sudo` access. The script writes `/etc/nginx/conf.d/rhais_upstream.conf` and reloads nginx.
-- Default nginx listen port is `8080` (override via `NGINX_LISTEN_PORT` env var when running the script).
+Notes:
+- You need `sudo` (or root) so the script can install the upstream file under `/etc/nginx/conf.d/` and reload the service.
+- Default nginx listen port is `8080` (override via `NGINX_LISTEN_PORT` when running the script).
+- If you only want to refresh Prometheus scrape jobs and skip nginx entirely: `SKIP_NGINX=1 ./scripts/02_scale.sh <TARGET_INSTANCES>`.
 
 Access:
 - RHAIS remains reachable directly on each port

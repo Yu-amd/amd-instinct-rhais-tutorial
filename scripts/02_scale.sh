@@ -14,6 +14,8 @@ CONTAINER_PREFIX="${RHAIS_CONTAINER_PREFIX:-rhais}"
 
 NGINX_LISTEN_PORT="${NGINX_LISTEN_PORT:-8080}"
 NGINX_UPSTREAM_FILE="${NGINX_UPSTREAM_FILE:-/etc/nginx/conf.d/rhais_upstream.conf}"
+# Set SKIP_NGINX=1 to skip upstream config reload (still updates Prometheus).
+SKIP_NGINX="${SKIP_NGINX:-0}"
 
 PROMETHEUS_YML="${PROMETHEUS_YML:-${REPO_ROOT}/grafana/prometheus.yml}"
 DOCKER_COMPOSE_FILE="${DOCKER_COMPOSE_FILE:-${REPO_ROOT}/grafana/docker-compose.yml}"
@@ -81,11 +83,11 @@ detect_gpus_round_robin() {
     out="$(rocm-smi --showid 2>/dev/null || true)"
     if [[ -n "${out}" ]]; then
       # Parse GPU[0], GPU[1], ...
-      mapfile -t ids < <(echo "${out}" | grep -oE 'GPU\\[[0-9]+\\]' | sed 's/.*\\[\\([0-9]\\+\\)\\].*/\\1/' | sort -n | uniq)
+      mapfile -t ids < <(echo "${out}" | grep -oE 'GPU\[[0-9]+\]' | sed -E 's/.*\[([0-9]+)\].*/\1/' | sort -n | uniq)
     fi
   fi
   if [[ "${#ids[@]}" -eq 0 ]]; then
-    warn "rocm-smi parsing failed; defaulting GPU_ID=0"
+    warn "rocm-smi parsing failed; defaulting GPU_ID=0" >&2
     ids=(0)
   fi
   echo "${ids[*]}"
@@ -98,6 +100,19 @@ port_health() {
   else
     echo "unhealthy"
   fi
+}
+
+require_nginx_unless_skipped() {
+  if [[ "${SKIP_NGINX}" == "1" ]]; then
+    return 0
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    return 0
+  fi
+  err "nginx is not installed (missing 'nginx' binary)."
+  err "Install nginx first (example): sudo apt-get update && sudo apt-get install -y nginx"
+  err "Or set SKIP_NGINX=1 to update Prometheus only (no nginx upstream)."
+  exit 1
 }
 
 write_nginx_config() {
@@ -198,6 +213,8 @@ main() {
   echo "Running ports: ${running_ports[*]}"
   echo
 
+  require_nginx_unless_skipped
+
   if [[ "${current}" -ge "${TARGET_INSTANCES}" ]]; then
     ok "Already running >= target instances; will still refresh nginx + Prometheus config."
   else
@@ -235,10 +252,14 @@ main() {
   mapfile -t running_ports < <(printf "%s\n" "${running_ports[@]}" | sort -n | uniq)
 
   echo
-  echo "== Updating nginx upstream =="
-  write_nginx_config "${running_ports[@]}"
-  reload_nginx
-  ok "nginx upstream updated (listen port ${NGINX_LISTEN_PORT})"
+  if [[ "${SKIP_NGINX}" == "1" ]]; then
+    warn "SKIP_NGINX=1 set; skipping nginx upstream update."
+  else
+    echo "== Updating nginx upstream =="
+    write_nginx_config "${running_ports[@]}"
+    reload_nginx
+    ok "nginx upstream updated (listen port ${NGINX_LISTEN_PORT})"
+  fi
 
   echo
   echo "== Updating Prometheus scrape config =="
@@ -261,7 +282,9 @@ main() {
   done
 
   echo
-  echo "nginx load balancer: http://127.0.0.1:${NGINX_LISTEN_PORT}/v1/chat/completions"
+  if [[ "${SKIP_NGINX}" != "1" ]]; then
+    echo "nginx load balancer: http://127.0.0.1:${NGINX_LISTEN_PORT}/v1/chat/completions"
+  fi
   echo "Direct endpoints: http://127.0.0.1:<PORT>/v1/chat/completions"
 }
 
