@@ -157,18 +157,78 @@ EOF
   rm -f "${tmpfile}"
 }
 
-reload_nginx() {
-  if command -v systemctl >/dev/null 2>&1; then
-    if [[ -n "${SUDO}" ]]; then
-      $SUDO systemctl reload nginx || $SUDO systemctl restart nginx
-    else
-      systemctl reload nginx || systemctl restart nginx
+warn_if_listen_port_in_use() {
+  local port="$1"
+  if ! command -v ss >/dev/null 2>&1; then
+    return 0
+  fi
+  if ss -ltn "sport = :${port}" 2>/dev/null | awk 'NR>1{found=1} END{exit !found}'; then
+    warn "Something is already listening on :${port}; nginx start may fail. Use a free port, e.g. NGINX_LISTEN_PORT=18080."
+  fi
+}
+
+apply_nginx_upstream() {
+  warn_if_listen_port_in_use "${NGINX_LISTEN_PORT}"
+
+  echo "== Testing nginx configuration =="
+  if [[ -n "${SUDO}" ]]; then
+    if ! $SUDO nginx -t; then
+      err "nginx -t failed. Fix the errors above (see ${NGINX_UPSTREAM_FILE})."
+      exit 1
     fi
   else
-    if [[ -n "${SUDO}" ]]; then
-      $SUDO nginx -s reload
+    if ! nginx -t; then
+      err "nginx -t failed. Fix the errors above (see ${NGINX_UPSTREAM_FILE})."
+      exit 1
+    fi
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+      echo "== Reloading nginx =="
+      if [[ -n "${SUDO}" ]]; then
+        $SUDO systemctl reload nginx || {
+          err "nginx reload failed. Try: sudo journalctl -xeu nginx.service --no-pager | tail -80"
+          exit 1
+        }
+      else
+        systemctl reload nginx || {
+          err "nginx reload failed. Try: journalctl -xeu nginx.service --no-pager | tail -80"
+          exit 1
+        }
+      fi
     else
-      nginx -s reload
+      echo "== Starting nginx (service was not active) =="
+      if [[ -n "${SUDO}" ]]; then
+        $SUDO systemctl enable nginx >/dev/null 2>&1 || true
+        $SUDO systemctl start nginx || {
+          err "nginx start failed."
+          err "Diagnostics: sudo nginx -t && sudo journalctl -xeu nginx.service --no-pager | tail -80"
+          err "If port ${NGINX_LISTEN_PORT} is in use: NGINX_LISTEN_PORT=<free_port> $0 ..."
+          exit 1
+        }
+      else
+        systemctl enable nginx >/dev/null 2>&1 || true
+        systemctl start nginx || {
+          err "nginx start failed."
+          err "Diagnostics: nginx -t && journalctl -xeu nginx.service --no-pager | tail -80"
+          err "If port ${NGINX_LISTEN_PORT} is in use: NGINX_LISTEN_PORT=<free_port> $0 ..."
+          exit 1
+        }
+      fi
+    fi
+  else
+    echo "== Sending reload signal to nginx (no systemd) =="
+    if [[ -n "${SUDO}" ]]; then
+      $SUDO nginx -s reload || {
+        err "nginx -s reload failed (is nginx master running?). Try: sudo nginx"
+        exit 1
+      }
+    else
+      nginx -s reload || {
+        err "nginx -s reload failed (is nginx master running?). Try: nginx"
+        exit 1
+      }
     fi
   fi
 }
@@ -265,7 +325,7 @@ main() {
   else
     echo "== Updating nginx upstream =="
     write_nginx_config "${running_ports[@]}"
-    reload_nginx
+    apply_nginx_upstream
     ok "nginx upstream updated (listen port ${NGINX_LISTEN_PORT})"
   fi
 

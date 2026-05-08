@@ -554,6 +554,29 @@ Fix:
 2. Confirm `HF_CACHE_DIR` is mounted (weights cache in the volume mount).
 3. Restart the server once network is stable; cached weights usually reduce subsequent startup to ~30s.
 
+### nginx fails to start or reload (`./scripts/02_scale.sh`)
+
+Symptoms:
+- `nginx.service is not active`, `cannot reload`, or `Job for nginx.service failed`.
+
+Fix:
+1. Validate configuration (includes `/etc/nginx/conf.d/rhais_upstream.conf` from the tutorial):
+   ```bash
+   sudo nginx -t
+   ```
+2. Read the service log:
+   ```bash
+   sudo journalctl -xeu nginx.service --no-pager | tail -80
+   ```
+3. If **`address already in use`** on the load-balancer port, pick a free port and re-run scaling (default is `8080`):
+   ```bash
+   NGINX_LISTEN_PORT=18080 ./scripts/02_scale.sh 8
+   ```
+4. If nginx was never enabled after install:
+   ```bash
+   sudo systemctl enable --now nginx
+   ```
+
 ### Prometheus not scraping (no metrics / missing panels)
 
 Common cause:
