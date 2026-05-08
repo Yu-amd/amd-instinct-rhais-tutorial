@@ -294,6 +294,8 @@ update_prometheus_jobs() {
     {print}
   ' "${PROMETHEUS_YML}" > "${tmp}"
   mv "${tmp}" "${PROMETHEUS_YML}"
+  # Prometheus container runs as nobody and must read this bind-mounted file.
+  chmod 0644 "${PROMETHEUS_YML}" 2>/dev/null || true
 }
 
 restart_prometheus() {

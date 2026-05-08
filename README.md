@@ -270,6 +270,9 @@ export PORT="${PORT:-8000}"
 
 # Keep Prometheus scrape target aligned with the active RHAIS port.
 sed -i -E "s#(targets: \\['host\\.docker\\.internal:)[0-9]+('\\])#\\1${PORT}\\2#" grafana/prometheus.yml
+
+# Prometheus in Docker runs as nobody(65534): the bind-mounted file must be world-readable.
+chmod 0644 grafana/prometheus.yml
 ```
 
 Start the monitoring services:
@@ -611,6 +614,21 @@ Fix:
    docker rm -f rhaiis_prometheus rhaiis_grafana 2>/dev/null || true
    docker compose -f grafana/docker-compose.yml up -d
    ```
+
+### Prometheus container unhealthy / crash loop (“permission denied” on `prometheus.yml`)
+
+Symptom:
+- Grafana reports dependency failed / Prometheus unhealthy, or `docker compose ps` shows Prometheus `Restarting`.
+
+Meaning:
+- The official image runs as **`nobody` (UID 65534)**. A bind-mounted `grafana/prometheus.yml` that is **`0640` / `0600` (root-only)** cannot be read inside the container.
+
+Fix:
+```bash
+chmod 0644 ~/amd-instinct-rhais-tutorial/grafana/prometheus.yml
+docker compose -f grafana/docker-compose.yml up -d
+docker logs "$(docker compose -f grafana/docker-compose.yml ps -q prometheus)" 2>&1 | tail -20
+```
 
 ### Prometheus not scraping (no metrics / missing panels)
 
