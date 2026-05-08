@@ -159,9 +159,17 @@ EOF
 
 reload_nginx() {
   if command -v systemctl >/dev/null 2>&1; then
-    "$SUDO" systemctl reload nginx || "$SUDO" systemctl restart nginx
+    if [[ -n "${SUDO}" ]]; then
+      $SUDO systemctl reload nginx || $SUDO systemctl restart nginx
+    else
+      systemctl reload nginx || systemctl restart nginx
+    fi
   else
-    "$SUDO" nginx -s reload
+    if [[ -n "${SUDO}" ]]; then
+      $SUDO nginx -s reload
+    else
+      nginx -s reload
+    fi
   fi
 }
 
