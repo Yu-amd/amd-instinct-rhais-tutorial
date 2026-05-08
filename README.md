@@ -600,11 +600,17 @@ Fix:
    docker compose -f grafana/docker-compose.yml ps
    curl -sS http://127.0.0.1:9090/-/healthy
    ```
-3. From inside Grafana, exec a quick DNS check (optional):
+3. From the Grafana service, check that `prometheus` resolves (optional):
    ```bash
-   docker exec rhaiis_grafana getent hosts prometheus
+   docker compose -f grafana/docker-compose.yml exec grafana getent hosts prometheus
    ```
-   If this fails, you are not on the shared network—do step 1 again after `git pull`.
+   If this fails, you are not on the shared network—repeat step 1 from the repo root (`git pull` first if you upgraded the compose file).
+
+4. **Container name conflict** after changing the compose setup (e.g. `The container name ".../rhaiis_prometheus" is already in use`): old containers kept a fixed name outside the current Compose project. Remove them, then bring the stack up again:
+   ```bash
+   docker rm -f rhaiis_prometheus rhaiis_grafana 2>/dev/null || true
+   docker compose -f grafana/docker-compose.yml up -d
+   ```
 
 ### Prometheus not scraping (no metrics / missing panels)
 
