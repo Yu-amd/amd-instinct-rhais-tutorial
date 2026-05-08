@@ -1,3 +1,6 @@
+# Stable project name keeps a single Compose network/DNS regardless of cwd.
+name: rhaiis-monitoring
+
 services:
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -8,6 +11,14 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/healthy >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - monitoring
     restart: unless-stopped
 
   grafana:
@@ -16,7 +27,9 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_healthy
+    dns_search: []
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
@@ -24,5 +37,12 @@ services:
     volumes:
       - ./provisioning:/etc/grafana/provisioning:ro
       - ./dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - monitoring
     restart: unless-stopped
+
+networks:
+  monitoring:
+    name: rhaiis_monitoring
+    driver: bridge
 

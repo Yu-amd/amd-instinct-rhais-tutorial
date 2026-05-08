@@ -580,6 +580,32 @@ Fix:
    sudo systemctl enable --now nginx
    ```
 
+### Grafana 502 calling Prometheus (“lookup prometheus … server misbehaving”)
+
+Symptom:
+- Panels show HTTP 502; datasource errors mention `prometheus`, `127.0.0.11`, or “server misbehaving”.
+
+Meaning:
+- Grafana is querying `http://prometheus:9090` (provisioned datasource). **`prometheus` is Docker-internal DNS.** That only works when Grafana and the Prometheus container share the **same Compose network**.
+
+Fix:
+1. Restart the monitoring stack **from `grafana/docker-compose.yml`** so both services attach to one project network (repo uses project name **`rhais-monitoring`** and shared network **`rhaiis_monitoring`**):
+   ```bash
+   cd ~/amd-instinct-rhais-tutorial
+   docker compose -f grafana/docker-compose.yml down
+   docker compose -f grafana/docker-compose.yml up -d
+   ```
+2. Confirm both are **`Up`** and Prometheus is healthy:
+   ```bash
+   docker compose -f grafana/docker-compose.yml ps
+   curl -sS http://127.0.0.1:9090/-/healthy
+   ```
+3. From inside Grafana, exec a quick DNS check (optional):
+   ```bash
+   docker exec rhaiis_grafana getent hosts prometheus
+   ```
+   If this fails, you are not on the shared network—do step 1 again after `git pull`.
+
 ### Prometheus not scraping (no metrics / missing panels)
 
 Common cause:
