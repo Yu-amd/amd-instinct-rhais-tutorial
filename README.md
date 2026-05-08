@@ -568,11 +568,14 @@ Fix:
    ```bash
    sudo journalctl -xeu nginx.service --no-pager | tail -80
    ```
-3. If **`address already in use`** on the load-balancer port, pick a free port and re-run scaling (default is `8080`):
+3. **`nginx -t` can pass while systemd start still fails.** Common causes:
+   - **Port 80 in use.** Ubuntu enables `/etc/nginx/sites-enabled/default`, which listens on `:80`. If another daemon already holds `:80`, nginx exits immediately even though `/etc/nginx/nginx.conf` looks valid. `./scripts/02_scale.sh` removes that symlink once (see script warnings); you can undo with `sudo ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default`. To preserve the stock site: `DISABLE_UBUNTU_DEFAULT_SITE=0 ./scripts/02_scale.sh 8`.
+   - **LB port clash:** check `sudo ss -ltn 'sport = :8080'` (tutorial default LB port).
+4. If **`address already in use`** on the load-balancer port, pick a free port and re-run scaling (default is `8080`):
    ```bash
    NGINX_LISTEN_PORT=18080 ./scripts/02_scale.sh 8
    ```
-4. If nginx was never enabled after install:
+5. If nginx was never enabled after install:
    ```bash
    sudo systemctl enable --now nginx
    ```

@@ -16,6 +16,8 @@ NGINX_LISTEN_PORT="${NGINX_LISTEN_PORT:-8080}"
 NGINX_UPSTREAM_FILE="${NGINX_UPSTREAM_FILE:-/etc/nginx/conf.d/rhais_upstream.conf}"
 # Set SKIP_NGINX=1 to skip upstream config reload (still updates Prometheus).
 SKIP_NGINX="${SKIP_NGINX:-0}"
+# Ubuntu ships a stock site listening on :80; if port 80 is busy, systemd start fails after nginx -t succeeds.
+DISABLE_UBUNTU_DEFAULT_SITE="${DISABLE_UBUNTU_DEFAULT_SITE:-1}"
 
 PROMETHEUS_YML="${PROMETHEUS_YML:-${REPO_ROOT}/grafana/prometheus.yml}"
 DOCKER_COMPOSE_FILE="${DOCKER_COMPOSE_FILE:-${REPO_ROOT}/grafana/docker-compose.yml}"
@@ -167,8 +169,39 @@ warn_if_listen_port_in_use() {
   fi
 }
 
+maybe_disable_stock_ubuntu_nginx_site() {
+  local default_site="/etc/nginx/sites-enabled/default"
+
+  if [[ "${DISABLE_UBUNTU_DEFAULT_SITE}" != "1" ]]; then
+    return 0
+  fi
+
+  [[ -f "${default_site}" || -L "${default_site}" ]] || return 0
+
+  warn "Ubuntu's stock site (${default_site}) listens on port 80. If :80 is in use by another package, systemd start fails—"
+  warn "nginx -t can still succeed. Removing that symlink only (restore: sudo ln -s /etc/nginx/sites-available/default ${default_site})."
+  warn "To keep stock site enabled: DISABLE_UBUNTU_DEFAULT_SITE=0 $0 ..."
+  if [[ -n "${SUDO}" ]]; then
+    $SUDO rm -f "${default_site}"
+  else
+    rm -f "${default_site}"
+  fi
+}
+
+dump_nginx_journal_tail() {
+  if command -v journalctl >/dev/null 2>&1; then
+    echo "--- nginx.service journal (last 40 lines) ---" >&2
+    if [[ -n "${SUDO}" ]]; then
+      $SUDO journalctl -u nginx.service -n 40 --no-pager >&2 || true
+    else
+      journalctl -u nginx.service -n 40 --no-pager >&2 || true
+    fi
+  fi
+}
+
 apply_nginx_upstream() {
   warn_if_listen_port_in_use "${NGINX_LISTEN_PORT}"
+  maybe_disable_stock_ubuntu_nginx_site
 
   echo "== Testing nginx configuration =="
   if [[ -n "${SUDO}" ]]; then
@@ -203,16 +236,18 @@ apply_nginx_upstream() {
         $SUDO systemctl enable nginx >/dev/null 2>&1 || true
         $SUDO systemctl start nginx || {
           err "nginx start failed."
-          err "Diagnostics: sudo nginx -t && sudo journalctl -xeu nginx.service --no-pager | tail -80"
-          err "If port ${NGINX_LISTEN_PORT} is in use: NGINX_LISTEN_PORT=<free_port> $0 ..."
+          dump_nginx_journal_tail
+          err "Also try: sudo nginx -t && sudo ss -ltn 'sport = :80'"
+          err "Load-balancer listen port clashes: NGINX_LISTEN_PORT=<free_port> $0 ..."
           exit 1
         }
       else
         systemctl enable nginx >/dev/null 2>&1 || true
         systemctl start nginx || {
           err "nginx start failed."
-          err "Diagnostics: nginx -t && journalctl -xeu nginx.service --no-pager | tail -80"
-          err "If port ${NGINX_LISTEN_PORT} is in use: NGINX_LISTEN_PORT=<free_port> $0 ..."
+          dump_nginx_journal_tail
+          err "Also try: nginx -t && ss -ltn 'sport = :80'"
+          err "Load-balancer listen port clashes: NGINX_LISTEN_PORT=<free_port> $0 ..."
           exit 1
         }
       fi
